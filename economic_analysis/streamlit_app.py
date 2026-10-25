@@ -96,10 +96,13 @@ if "yr_start" not in st.session_state:
     st.session_state.yr_start = 2000
 if "yr_end" not in st.session_state:
     st.session_state.yr_end = 2025
+if "yr_range" not in st.session_state:
+    st.session_state.yr_range = (st.session_state.yr_start, st.session_state.yr_end)
 
 def apply_preset(s, e):
     st.session_state.yr_start = s
     st.session_state.yr_end = e
+    st.session_state.yr_range = (s, e)
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -176,7 +179,7 @@ def load_us_indicators(selected: list[str]) -> pd.DataFrame:
         cfg = US_INDICATORS[name]
         raw = fetch_fred(cfg["symbol"])
         if cfg["transform"] == "yoy":
-            raw = raw.pct_change(12) * 100
+            raw = raw.ffill().pct_change(12) * 100
         frames[name] = raw
     return pd.DataFrame(frames).dropna(how="all")
 
@@ -541,16 +544,17 @@ def render_global_summary(wb_df: pd.DataFrame, indicator: str, s: int, e: int, s
 
     latest_year  = sub.dropna(how="all").index[-1]
     earliest_year = sub.dropna(how="all").index[0]
-    latest_row   = sub.loc[latest_year].dropna()
     available    = [c for c in selected_countries if c in sub.columns]
+    # each country's latest value in the range (up to 2 years old), so late reporters aren't dropped
+    latest_row   = sub[available].ffill(limit=2).iloc[-1].dropna()
 
     st.markdown(f"## In-Depth Global Summary: {indicator}")
     st.caption(f"Countries: {', '.join(available)} · Period: {earliest_year}–{latest_year} · Source: World Bank")
     st.divider()
 
     # ── Global snapshot ───────────────────────────────────────────────────────
-    st.markdown(f"### Snapshot: {latest_year}")
-    if not latest_row.empty:
+    st.markdown(f"### Snapshot: latest data (up to {latest_year})")
+    if len(latest_row) >= 2:
         ranked     = latest_row.sort_values(ascending=False)
         global_avg = latest_row.mean()
         spread     = latest_row.max() - latest_row.min()
@@ -562,11 +566,13 @@ def render_global_summary(wb_df: pd.DataFrame, indicator: str, s: int, e: int, s
         snap_c4.metric("Spread (High–Low)", f"{spread:.2f}")
 
         st.markdown(f"""
-In **{latest_year}**, the average **{indicator}** across selected countries was **{global_avg:.2f}**.
+In the latest data (up to **{latest_year}**), the average **{indicator}** across selected countries was **{global_avg:.2f}**.
 The gap between the highest (**{ranked.index[0]}** at {ranked.iloc[0]:.2f}) and lowest
 (**{ranked.index[-1]}** at {ranked.iloc[-1]:.2f}) was **{spread:.2f}** — indicating
-{"extreme divergence between economies" if spread > global_avg * 2 else "significant but manageable variation" if spread > global_avg else "relatively convergent performance across countries"}.
+{"extreme divergence between economies" if spread > abs(global_avg) * 2 else "significant but manageable variation" if spread > abs(global_avg) else "relatively convergent performance across countries"}.
 """)
+    else:
+        st.info("Need at least two countries with recent data for a cross-country snapshot.")
 
     st.divider()
 
@@ -590,12 +596,14 @@ The gap between the highest (**{ranked.index[0]}** at {ranked.iloc[0]:.2f}) and 
         volatility   = col_data.std()
 
         # Trend over last 5 years
-        recent = col_data.iloc[-5:] if len(col_data) >= 5 else col_data
-        prior  = col_data.iloc[-10:-5] if len(col_data) >= 10 else col_data
+        recent = col_data.iloc[-5:]
+        prior  = col_data.iloc[-10:-5]
         trend  = "improving" if recent.mean() < prior.mean() else "worsening"
         # For GDP Growth / GDP per capita, higher = better; invert for inflation/unemployment
         if "GDP" in indicator:
             trend = "improving" if recent.mean() > prior.mean() else "worsening"
+        if prior.empty:  # 5 points or fewer: there is no prior period to compare with
+            trend = "n/a"
 
         # Rank in latest year
         if not latest_row.empty and country in latest_row.index:
@@ -619,13 +627,13 @@ ranking **{rank_label}** among selected countries.
 
 Over the {earliest_yr}–{latest_yr} period, the indicator averaged **{avg_val:.2f}**
 with a standard deviation of **{volatility:.2f}** —
-{"highly volatile" if volatility > avg_val * 0.5 else "moderately volatile" if volatility > avg_val * 0.2 else "relatively stable"}.
+{"highly volatile" if volatility > abs(avg_val) * 0.5 else "moderately volatile" if volatility > abs(avg_val) * 0.2 else "relatively stable"}.
 The total change from {earliest_yr} to {latest_yr} was **{total_change:+.2f}**
 ({"improving" if (total_change < 0 and "Inflation" in indicator) or (total_change < 0 and "Unemployment" in indicator) or (total_change > 0 and "GDP" in indicator) else "worsening"} direction).
 
 The peak of **{peak_val:.2f}** occurred in **{peak_yr}**
 and the trough of **{trough_val:.2f}** in **{trough_yr}**.
-Recent 5-year trend is **{trend}** compared to the prior 5-year period.
+{f"Recent 5-year trend is **{trend}** compared to the prior 5-year period." if trend != "n/a" else "Too few years in this range to compare the latest 5 years with the 5 before."}
 """)
 
             # Country-specific context callouts
@@ -683,20 +691,21 @@ Recent 5-year trend is **{trend}** compared to the prior 5-year period.
                 changes[country] = col_data.iloc[-1] - col_data.iloc[0]
 
         if changes:
-            best_country = min(changes, key=changes.get) if "Inflation" in indicator or "Unemployment" in indicator else max(changes, key=changes.get)
-            worst_country = max(changes, key=changes.get) if "Inflation" in indicator or "Unemployment" in indicator else min(changes, key=changes.get)
-            st.markdown(f"""
-**Biggest improvement** over {earliest_year}–{latest_year}: **{best_country}**
-(change: {changes[best_country]:+.2f})
-
-**Biggest deterioration** over {earliest_year}–{latest_year}: **{worst_country}**
-(change: {changes[worst_country]:+.2f})
-""")
+            sign = -1 if "Inflation" in indicator or "Unemployment" in indicator else 1  # +1: higher is better
+            best_country  = max(changes, key=lambda c: sign * changes[c])
+            worst_country = min(changes, key=lambda c: sign * changes[c])
+            # only name a country that really moved that way
+            if sign * changes[best_country] > 0:
+                st.markdown(f"**Biggest improvement** over {earliest_year}–{latest_year}: **{best_country}** "
+                            f"(change: {changes[best_country]:+.2f})")
+            if sign * changes[worst_country] < 0:
+                st.markdown(f"**Biggest deterioration** over {earliest_year}–{latest_year}: **{worst_country}** "
+                            f"(change: {changes[worst_country]:+.2f})")
 
         # Convergence / divergence
         early_std = sub.loc[earliest_year:earliest_year+4].std(axis=1).mean() if len(sub) > 5 else None
         recent_std = sub.iloc[-5:].std(axis=1).mean()
-        if early_std is not None:
+        if early_std is not None and pd.notna(early_std) and pd.notna(recent_std):
             if recent_std < early_std * 0.8:
                 st.info(f"**Convergence:** Countries have become MORE similar over time (spread narrowed from ~{early_std:.2f} to ~{recent_std:.2f}). This suggests shared global forces or policy coordination.")
             elif recent_std > early_std * 1.2:
@@ -708,7 +717,7 @@ Recent 5-year trend is **{trend}** compared to the prior 5-year period.
 
     # ── Overall verdict ───────────────────────────────────────────────────────
     st.markdown("### Overall Period Assessment")
-    if not latest_row.empty:
+    if len(latest_row) >= 2:
         avg = latest_row.mean()
         high_performers = [c for c in latest_row.index if (
             (latest_row[c] < avg and ("Inflation" in indicator or "Unemployment" in indicator)) or
@@ -717,15 +726,17 @@ Recent 5-year trend is **{trend}** compared to the prior 5-year period.
         low_performers = [c for c in latest_row.index if c not in high_performers]
 
         if high_performers:
-            st.success(f"**Outperforming in {latest_year}:** {', '.join(high_performers)}")
+            st.success(f"**Outperforming (latest data, up to {latest_year}):** {', '.join(high_performers)}")
         if low_performers:
-            st.warning(f"**Underperforming in {latest_year}:** {', '.join(low_performers)}")
+            st.warning(f"**Underperforming (latest data, up to {latest_year}):** {', '.join(low_performers)}")
 
         st.markdown(f"""
-The **{indicator}** data for {s}–{e} reveals {"significant" if latest_row.std() > latest_row.mean() * 0.5 else "moderate"} variation
+The **{indicator}** data for {s}–{e} reveals {"significant" if latest_row.std() > abs(latest_row.mean()) * 0.5 else "moderate"} variation
 across selected countries. With a group average of **{avg:.2f}** in {latest_year}, the data
-shows that economic outcomes are {"highly divergent — country-specific factors dominate" if latest_row.std() > latest_row.mean() * 0.5 else "broadly aligned — global forces are the dominant driver"}.
+shows that economic outcomes are {"highly divergent — country-specific factors dominate" if latest_row.std() > abs(latest_row.mean()) * 0.5 else "broadly aligned — global forces are the dominant driver"}.
 """)
+    else:
+        st.info("Need at least two countries with recent data for a cross-country assessment.")
 
 
 # ── Forecasting ──────────────────────────────────────────────────────────────
@@ -869,7 +880,7 @@ def render_period_comparison(df: pd.DataFrame, selected: list):
 
 
 # ── Composite Scorecard (Global) ──────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+# Not cached itself: fetch_worldbank caches each indicator that loads, and a failed one is retried next run
 def fetch_all_wb(country_codes: tuple) -> dict:
     """Fetch all 4 World Bank indicators for the scorecard."""
     results = {}
@@ -884,7 +895,6 @@ def fetch_all_wb(country_codes: tuple) -> dict:
 
 
 def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
-    st.markdown("### Economy Scorecard")
     st.caption(
         "Composite ranking across Inflation, Unemployment, GDP Growth, and GDP per Capita. "
         "Score 0–100 per indicator (higher = better). Normalized within the selected country group."
@@ -893,16 +903,26 @@ def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
     if not all_data:
         st.warning("No scorecard data could be loaded.")
         return
+    missing = [k for k in GLOBAL_INDICATORS if k not in all_data]
+    if missing:
+        st.warning("Could not load: " + ", ".join(missing) + " — scores use the remaining indicators.")
 
     LOWER_BETTER = {"Inflation (annual %)", "Unemployment (% labor force)"}
-    scores: dict[str, dict] = {c: {} for c in selected_countries}
 
+    # Each country's latest value at or before the reference year, at most 2 years old
+    latest: dict[str, pd.Series] = {}
     for ind_name, wb_df in all_data.items():
-        avail = wb_df.dropna(how="all").index
-        if len(avail) == 0:
-            continue
-        yr = min(avail, key=lambda y: abs(y - ref_year))
-        row = wb_df.loc[yr].dropna()
+        past = wb_df.loc[:ref_year]
+        if not past.empty:
+            latest[ind_name] = past.ffill(limit=2).iloc[-1].dropna()
+
+    # Rank only countries with every indicator, so a missing value can't lift a composite
+    ranked  = [c for c in selected_countries if latest and all(c in row.index for row in latest.values())]
+    skipped = [c for c in selected_countries if c not in ranked]
+    scores: dict[str, dict] = {c: {} for c in ranked}
+
+    for ind_name, row in latest.items():
+        row = row[ranked]
         if len(row) < 2:
             continue
 
@@ -910,14 +930,12 @@ def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
         if hi == lo:
             continue
 
-        for country in selected_countries:
-            if country not in row.index:
-                continue
+        for country in ranked:
             norm = (row[country] - lo) / (hi - lo) * 100
             scores[country][ind_name] = (100 - norm) if ind_name in LOWER_BETTER else norm
 
     rows = []
-    for country in selected_countries:
+    for country in ranked:
         if not scores[country]:
             continue
         vals    = list(scores[country].values())
@@ -932,6 +950,8 @@ def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
     if not rows:
         st.warning("Not enough data to build scorecard. Try different countries or year.")
         return
+    if skipped:
+        st.caption(f"Not ranked (missing an indicator near {ref_year}): {', '.join(skipped)}")
 
     sc_df = (pd.DataFrame(rows)
                .sort_values("Score", ascending=False)
@@ -943,7 +963,7 @@ def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
         hide_index=True, use_container_width=True,
     )
 
-    if len(rows) >= 2:
+    if len(rows) >= 2 and sc_df["Score"].iloc[0] > sc_df["Score"].iloc[-1]:
         winner = sc_df.iloc[0]
         loser  = sc_df.iloc[-1]
         st.success(
@@ -1016,14 +1036,14 @@ with st.sidebar:
     st.divider()
     st.markdown("**Time Period**")
     for label, (ps, pe) in PRESETS.items():
-        active = st.session_state.yr_start == ps and st.session_state.yr_end == pe
+        active = tuple(st.session_state.yr_range) == (ps, pe)
         st.button(f"{'✅ ' if active else ''}{label}", on_click=apply_preset,
                   args=(ps, pe), use_container_width=True, key=f"p_{label}")
 
     st.caption("Custom range:")
-    year_range = st.slider("", min_value=1961, max_value=2025,
-                           value=(st.session_state.yr_start, st.session_state.yr_end),
-                           label_visibility="collapsed")
+    # Keyed, so a drag isn't lost when the default value changes on the next rerun
+    year_range = st.slider("Custom range", min_value=1961, max_value=2025,
+                           key="yr_range", label_visibility="collapsed")
     st.session_state.yr_start = year_range[0]
     st.session_state.yr_end   = year_range[1]
 
@@ -1349,26 +1369,29 @@ else:
         fc_country = st.selectbox("Country to forecast", avail_countries, key="fc_country")
 
         col_raw = sub_wb[fc_country].dropna()
+        # World Bank rows are indexed by integer year; resampling and the date axis need real dates
+        col_raw.index = pd.to_datetime(col_raw.index.astype(str), format="%Y")
         if len(col_raw) < 5:
             st.warning("Need at least 5 years of data to project.")
         else:
             # Interpolate annual → monthly for smoother plot
             col_m = col_raw.resample("MS").interpolate("linear")
 
-            # Fit on annual data for stability
-            x_a = np.arange(len(col_raw))
+            # Fit on annual data for stability (x = years since the first point, so gaps keep their width)
+            x_a = col_raw.index.year.to_numpy() - col_raw.index[0].year
             sl, ic, r, p, _ = stats.linregress(x_a, col_raw.values)
             rmse   = np.sqrt(np.mean((col_raw.values - (sl * x_a + ic))**2))
             x_mean = x_a.mean(); ss_x = np.sum((x_a - x_mean)**2)
 
             # Project 5 years ahead (annual)
             n_fwd  = 5
-            fx_a   = np.arange(len(col_raw), len(col_raw) + n_fwd)
+            fx_a   = np.arange(x_a[-1] + 1, x_a[-1] + 1 + n_fwd)
             fdates = pd.date_range(
-                str(col_raw.index[-1] + 1), periods=n_fwd, freq="YS")
+                col_raw.index[-1] + pd.DateOffset(years=1), periods=n_fwd, freq="YS")
             fvals  = sl * fx_a + ic
-            ci     = 1.96 * rmse * np.sqrt(
-                1 + 1/len(col_raw) + (fx_a - x_mean)**2 / ss_x)
+            n_obs  = len(col_raw)  # >= 5, so n_obs - 2 >= 3
+            ci     = stats.t.ppf(0.975, n_obs - 2) * rmse * np.sqrt(n_obs / (n_obs - 2)) * np.sqrt(
+                1 + 1/n_obs + (fx_a - x_mean)**2 / ss_x)
 
             ma = col_m.rolling(24).mean()
 
@@ -1410,18 +1433,19 @@ else:
             st.warning("Not enough years of data for period comparison.")
         else:
             mid = avail_yrs[len(avail_yrs) // 2]
+            span = f"{avail_yrs[0]}_{avail_yrs[-1]}_{len(avail_yrs)}"  # new years -> fresh defaults
             pc1, pc2 = st.columns(2)
             with pc1:
                 st.markdown("**Period A**")
-                gpa_s = st.selectbox("Start", avail_yrs, index=0, key="gpa_s")
+                gpa_s = st.selectbox("Start", avail_yrs, index=0, key=f"gpa_s_{span}")
                 gpa_e = st.selectbox("End",   avail_yrs,
-                                     index=len(avail_yrs)//2 - 1, key="gpa_e")
+                                     index=len(avail_yrs)//2 - 1, key=f"gpa_e_{span}")
             with pc2:
                 st.markdown("**Period B**")
                 gpb_s = st.selectbox("Start", avail_yrs,
-                                     index=len(avail_yrs)//2, key="gpb_s")
+                                     index=len(avail_yrs)//2, key=f"gpb_s_{span}")
                 gpb_e = st.selectbox("End",   avail_yrs,
-                                     index=len(avail_yrs)-1, key="gpb_e")
+                                     index=len(avail_yrs)-1, key=f"gpb_e_{span}")
 
             lower_better = "Inflation" in global_indicator or "Unemployment" in global_indicator
             df_a = sub_wb.loc[gpa_s:gpa_e]
@@ -1457,9 +1481,13 @@ else:
                     f"from Period A to Period B")
                 st.markdown(
                     f"- **{worsened_n}** countries **worsened** or stayed the same")
-                top = min(rows, key=lambda r: float(r["Change"].replace("+","")) if lower_better
-                          else -float(r["Change"].replace("+","")))
-                st.success(f"**Biggest improver:** {top['Country']} (change: {top['Change']})")
+                improvers = [r for r in rows if r["Improved?"] == "✅"]
+                if improvers:
+                    top = min(improvers, key=lambda r: float(r["Change"]) if lower_better
+                              else -float(r["Change"]))
+                    st.success(f"**Biggest improver:** {top['Country']} (change: {top['Change']})")
+                else:
+                    st.info("No country improved between the two periods.")
             else:
                 st.info("No overlapping data for both periods.")
 
@@ -1469,8 +1497,11 @@ else:
             "Ranks all selected countries across ALL four indicators simultaneously. "
             "Fetches additional data if not already loaded — may take a few seconds."
         )
-        sc_year = st.slider("Reference year for scorecard", min_value=s, max_value=e,
-                            value=min(e, 2023), key="sc_year")
+        if s < e:
+            sc_year = st.slider("Reference year for scorecard", min_value=s, max_value=e,
+                                value=max(s, min(e, 2023)), key="sc_year")
+        else:  # a one-year range: a slider needs min < max
+            sc_year = s
         with st.spinner("Loading all indicators for scorecard..."):
             all_wb = fetch_all_wb(country_codes)
         render_scorecard(all_wb, selected_countries, sc_year)
