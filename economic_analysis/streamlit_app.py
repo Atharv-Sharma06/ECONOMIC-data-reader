@@ -387,8 +387,11 @@ def render_us_summary(df: pd.DataFrame, selected: list[str], s: int, e: int):
         latest_dt    = col.index[-1].strftime("%B %Y")
         prev_yr      = year_ago(col)
         yr_change    = latest - prev_yr if prev_yr is not None else None
-        trend_12     = col.iloc[-12:].mean()
-        trend_prev12 = col.iloc[-24:-12].mean() if len(col) >= 24 else np.nan
+        # 12-month windows by date, so a missing month doesn't shift them
+        cut          = col.index[-1] - pd.DateOffset(years=1)
+        trend_12     = col[col.index > cut].mean()
+        trend_prev12 = (col[(col.index > cut - pd.DateOffset(years=1)) & (col.index <= cut)].mean()
+                        if col.index[0] <= cut - pd.DateOffset(months=11) else np.nan)
         # under 24 months there is no separate prior 12-month window to compare with
         direction    = "n/a" if pd.isna(trend_prev12) else "rising" if trend_12 > trend_prev12 else "falling"
         volatility   = col.std()
@@ -427,7 +430,7 @@ with a standard deviation of **{volatility:.2f}{unit}** — indicating
 The most recent reading of **{latest:.2f}{unit}** ({latest_dt}) is {z_label}
 (z-score: {z:+.2f}).
 
-**Trend:** {f"The indicator is currently **{direction}** — the 12-month average ({trend_12:.2f}{unit}) is {'above' if trend_12 > trend_prev12 else 'below'} the prior 12-month average ({trend_prev12:.2f}{unit})." if direction != "n/a" else "Fewer than 24 months in this range, so there is no prior 12-month period to compare with."}
+**Trend:** {f"The indicator is currently **{direction}** — the 12-month average ({trend_12:.2f}{unit}) is {'above' if trend_12 > trend_prev12 else 'below'} the prior 12-month average ({trend_prev12:.2f}{unit})." if direction != "n/a" else "Less than 24 months of data in this range, so there is no prior 12-month period to compare with."}
 Short-term momentum is **{mom_label}** (3-month change: {mom:+.2f}{unit}).
 
 **Historical context:** {pct_above:.0f}% of monthly readings in this period were
