@@ -179,7 +179,9 @@ def load_us_indicators(selected: list[str]) -> pd.DataFrame:
         cfg = US_INDICATORS[name]
         raw = fetch_fred(cfg["symbol"])
         if cfg["transform"] == "yoy":
-            raw = raw.ffill().pct_change(12) * 100
+            # pad a quarterly series (GDPC1) to monthly first; a monthly series keeps its real gaps
+            quarterly = raw.dropna().index.month.nunique() <= 4
+            raw = (raw.ffill() if quarterly else raw).pct_change(12, fill_method=None) * 100
         frames[name] = raw
     return pd.DataFrame(frames).dropna(how="all")
 
@@ -545,8 +547,8 @@ def render_global_summary(wb_df: pd.DataFrame, indicator: str, s: int, e: int, s
     latest_year  = sub.dropna(how="all").index[-1]
     earliest_year = sub.dropna(how="all").index[0]
     available    = [c for c in selected_countries if c in sub.columns]
-    # each country's latest value in the range (up to 2 years old), so late reporters aren't dropped
-    latest_row   = sub[available].ffill(limit=2).iloc[-1].dropna()
+    # each country's latest value from the last 3 calendar years of the range, so late reporters aren't dropped
+    latest_row   = sub.loc[latest_year - 2:, available].ffill().iloc[-1].dropna()
 
     st.markdown(f"## In-Depth Global Summary: {indicator}")
     st.caption(f"Countries: {', '.join(available)} · Period: {earliest_year}–{latest_year} · Source: World Bank")
@@ -633,7 +635,7 @@ The total change from {earliest_yr} to {latest_yr} was **{total_change:+.2f}**
 
 The peak of **{peak_val:.2f}** occurred in **{peak_yr}**
 and the trough of **{trough_val:.2f}** in **{trough_yr}**.
-{f"Recent 5-year trend is **{trend}** compared to the prior 5-year period." if trend != "n/a" else "Too few years in this range to compare the latest 5 years with the 5 before."}
+{f"The trend for {recent.index[0]}–{recent.index[-1]} is **{trend}** compared to {prior.index[0]}–{prior.index[-1]}." if trend != "n/a" else "Too few years in this range to compare the latest 5 years with the years before."}
 """)
 
             # Country-specific context callouts
@@ -690,7 +692,7 @@ and the trough of **{trough_val:.2f}** in **{trough_yr}**.
             if len(col_data) >= 2:
                 changes[country] = col_data.iloc[-1] - col_data.iloc[0]
 
-        if changes:
+        if len(changes) >= 2:
             sign = -1 if "Inflation" in indicator or "Unemployment" in indicator else 1  # +1: higher is better
             best_country  = max(changes, key=lambda c: sign * changes[c])
             worst_country = min(changes, key=lambda c: sign * changes[c])
@@ -732,7 +734,7 @@ and the trough of **{trough_val:.2f}** in **{trough_yr}**.
 
         st.markdown(f"""
 The **{indicator}** data for {s}–{e} reveals {"significant" if latest_row.std() > abs(latest_row.mean()) * 0.5 else "moderate"} variation
-across selected countries. With a group average of **{avg:.2f}** in {latest_year}, the data
+across selected countries. With a group average of **{avg:.2f}** (latest data, up to {latest_year}), the data
 shows that economic outcomes are {"highly divergent — country-specific factors dominate" if latest_row.std() > abs(latest_row.mean()) * 0.5 else "broadly aligned — global forces are the dominant driver"}.
 """)
     else:
@@ -808,20 +810,24 @@ def render_period_comparison(df: pd.DataFrame, selected: list):
     min_yr = int(df.index.year.min())
     max_yr = int(df.index.year.max())
     mid    = (min_yr + max_yr) // 2
+    if max_yr - min_yr < 3:  # the default A/B windows need at least 4 calendar years
+        st.info("Pick a range of at least 4 years to compare two periods.")
+        return
+    span = f"{min_yr}_{max_yr}"  # new range -> fresh defaults
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Period A**")
         pa_s = st.number_input("Start", min_value=min_yr, max_value=max_yr - 1,
-                               value=min_yr, key="pa_s")
+                               value=min_yr, key=f"pa_s_{span}")
         pa_e = st.number_input("End",   min_value=min_yr + 1, max_value=max_yr,
-                               value=mid,    key="pa_e")
+                               value=mid,    key=f"pa_e_{span}")
     with col2:
         st.markdown("**Period B**")
         pb_s = st.number_input("Start", min_value=min_yr, max_value=max_yr - 1,
-                               value=mid + 1, key="pb_s")
+                               value=mid + 1, key=f"pb_s_{span}")
         pb_e = st.number_input("End",   min_value=min_yr + 1, max_value=max_yr,
-                               value=max_yr,  key="pb_e")
+                               value=max_yr,  key=f"pb_e_{span}")
 
     df_a = df[str(pa_s):str(pa_e)]
     df_b = df[str(pb_s):str(pb_e)]
@@ -903,18 +909,22 @@ def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
     if not all_data:
         st.warning("No scorecard data could be loaded.")
         return
-    missing = [k for k in GLOBAL_INDICATORS if k not in all_data]
-    if missing:
-        st.warning("Could not load: " + ", ".join(missing) + " — scores use the remaining indicators.")
 
     LOWER_BETTER = {"Inflation (annual %)", "Unemployment (% labor force)"}
 
-    # Each country's latest value at or before the reference year, at most 2 years old
+    # Each country's latest value from the reference year or the 2 years before it
     latest: dict[str, pd.Series] = {}
     for ind_name, wb_df in all_data.items():
-        past = wb_df.loc[:ref_year]
-        if not past.empty:
-            latest[ind_name] = past.ffill(limit=2).iloc[-1].dropna()
+        window = wb_df.loc[ref_year - 2:ref_year]
+        if not window.empty:
+            latest[ind_name] = window.ffill().iloc[-1].dropna()
+
+    failed  = [k for k in GLOBAL_INDICATORS if k not in all_data]
+    no_data = [k for k in all_data if k not in latest]
+    if failed:
+        st.warning("Could not load: " + ", ".join(failed) + " — scores use the remaining indicators.")
+    if no_data:
+        st.warning(f"No data near {ref_year} for: " + ", ".join(no_data) + " — scores use the remaining indicators.")
 
     # Rank only countries with every indicator, so a missing value can't lift a composite
     ranked  = [c for c in selected_countries if latest and all(c in row.index for row in latest.values())]
@@ -947,29 +957,31 @@ def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
             r[short] = round(scores[country].get(ind_name, np.nan), 1)
         rows.append(r)
 
+    if skipped:
+        st.caption(f"Not ranked (missing an indicator near {ref_year}): {', '.join(skipped)}")
     if not rows:
         st.warning("Not enough data to build scorecard. Try different countries or year.")
         return
-    if skipped:
-        st.caption(f"Not ranked (missing an indicator near {ref_year}): {', '.join(skipped)}")
 
     sc_df = (pd.DataFrame(rows)
                .sort_values("Score", ascending=False)
                .reset_index(drop=True))
-    sc_df["Rank"] = range(1, len(sc_df) + 1)
+    sc_df["Rank"] = sc_df["Score"].rank(method="min", ascending=False).astype(int)  # ties share a rank
 
     st.dataframe(
         sc_df.style.background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
         hide_index=True, use_container_width=True,
     )
 
-    if len(rows) >= 2 and sc_df["Score"].iloc[0] > sc_df["Score"].iloc[-1]:
+    # name a strongest / weakest country only when it isn't tied with the next one
+    if len(rows) >= 2 and sc_df["Score"].iloc[0] > sc_df["Score"].iloc[1]:
         winner = sc_df.iloc[0]
-        loser  = sc_df.iloc[-1]
         st.success(
             f"**Strongest economy (composite):** {winner['Country']} — "
             f"Score {winner['Score']}/100, Grade {winner['Grade']}"
         )
+    if len(rows) >= 2 and sc_df["Score"].iloc[-1] < sc_df["Score"].iloc[-2]:
+        loser = sc_df.iloc[-1]
         st.warning(
             f"**Most room for improvement:** {loser['Country']} — "
             f"Score {loser['Score']}/100, Grade {loser['Grade']}"
@@ -1242,15 +1254,15 @@ else:
     # ── Metrics ───────────────────────────────────────────────────────────────
     sub_wb = wb_df.loc[s:e] if s in wb_df.index or e in wb_df.index else wb_df
     latest_year = sub_wb.dropna(how="all").index[-1]
-    latest_row  = sub_wb.loc[latest_year].dropna()
 
     metric_cols = st.columns(min(len(selected_countries), 5))
     for i, country in enumerate(selected_countries[:5]):
-        if country in latest_row.index:
+        col_c = sub_wb[country].dropna() if country in sub_wb.columns else pd.Series(dtype=float)
+        if not col_c.empty and latest_year - col_c.index[-1] <= 2:  # own latest value, up to 2 years old
             metric_cols[i].metric(
                 label=country,
-                value=f"{latest_row[country]:.1f}",
-                delta=f"({latest_year})",
+                value=f"{col_c.iloc[-1]:.1f}",
+                delta=f"({col_c.index[-1]})",
             )
 
     st.divider()
