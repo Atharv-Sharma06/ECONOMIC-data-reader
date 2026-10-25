@@ -194,6 +194,12 @@ def shade_recessions(ax, index):
             ax.axvspan(rs_dt, re_dt, color="#d0d0d0", alpha=0.45, lw=0)
 
 
+def year_ago(col: pd.Series):
+    """The reading 12 months before the latest one, found by date so a missing month can't shift it; None if the series is shorter than that."""
+    target = col.index[-1] - pd.DateOffset(years=1)
+    return col.asof(target) if target >= col.index[0] else None
+
+
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv().encode("utf-8")
 
@@ -379,11 +385,12 @@ def render_us_summary(df: pd.DataFrame, selected: list[str], s: int, e: int):
         # Trend calculations
         latest       = col.iloc[-1]
         latest_dt    = col.index[-1].strftime("%B %Y")
-        prev_yr      = col.iloc[-13] if len(col) > 13 else col.iloc[0]
-        yr_change    = latest - prev_yr
+        prev_yr      = year_ago(col)
+        yr_change    = latest - prev_yr if prev_yr is not None else None
         trend_12     = col.iloc[-12:].mean()
-        trend_prev12 = col.iloc[-24:-12].mean() if len(col) >= 24 else col.iloc[:12].mean()
-        direction    = "rising" if trend_12 > trend_prev12 else "falling"
+        trend_prev12 = col.iloc[-24:-12].mean() if len(col) >= 24 else np.nan
+        # under 24 months there is no separate prior 12-month window to compare with
+        direction    = "n/a" if pd.isna(trend_prev12) else "rising" if trend_12 > trend_prev12 else "falling"
         volatility   = col.std()
         hist_mean    = col.mean()
         pct_above    = (col > hist_mean).mean() * 100
@@ -402,9 +409,11 @@ def render_us_summary(df: pd.DataFrame, selected: list[str], s: int, e: int):
         mom = col.iloc[-3:].mean() - col.iloc[-6:-3].mean() if len(col) >= 6 else 0
         mom_label = "accelerating" if mom > 0.1 else "decelerating" if mom < -0.1 else "stable"
 
-        with st.expander(f"**{name}**  —  Latest: {latest:.2f}{unit}  |  Trend: {direction.upper()}", expanded=True):
+        trend_lbl = f"  |  Trend: {direction.upper()}" if direction != "n/a" else ""
+        with st.expander(f"**{name}**  —  Latest: {latest:.2f}{unit}{trend_lbl}", expanded=True):
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Latest",   f"{latest:.2f}{unit}",   f"{yr_change:+.2f}{unit} vs yr ago")
+            c1.metric("Latest",   f"{latest:.2f}{unit}",
+                      f"{yr_change:+.2f}{unit} vs yr ago" if yr_change is not None else None)
             c2.metric("Average",  f"{hist_mean:.2f}{unit}")
             c3.metric("Peak",     f"{col.max():.2f}{unit}", col.idxmax().strftime("%b %Y"))
             c4.metric("Trough",   f"{col.min():.2f}{unit}", col.idxmin().strftime("%b %Y"))
@@ -418,9 +427,7 @@ with a standard deviation of **{volatility:.2f}{unit}** — indicating
 The most recent reading of **{latest:.2f}{unit}** ({latest_dt}) is {z_label}
 (z-score: {z:+.2f}).
 
-**Trend:** The indicator is currently **{direction}** — the 12-month average
-({trend_12:.2f}{unit}) is {"above" if trend_12 > trend_prev12 else "below"} the
-prior 12-month average ({trend_prev12:.2f}{unit}).
+**Trend:** {f"The indicator is currently **{direction}** — the 12-month average ({trend_12:.2f}{unit}) is {'above' if trend_12 > trend_prev12 else 'below'} the prior 12-month average ({trend_prev12:.2f}{unit})." if direction != "n/a" else "Fewer than 24 months in this range, so there is no prior 12-month period to compare with."}
 Short-term momentum is **{mom_label}** (3-month change: {mom:+.2f}{unit}).
 
 **Historical context:** {pct_above:.0f}% of monthly readings in this period were
@@ -807,11 +814,15 @@ def render_period_comparison(df: pd.DataFrame, selected: list):
     st.markdown("### Period vs Period Comparison")
     st.caption("Compare average economic conditions across any two time windows.")
 
+    if df.empty:
+        st.info("No data for the selected indicators in this range.")
+        return
     min_yr = int(df.index.year.min())
     max_yr = int(df.index.year.max())
     mid    = (min_yr + max_yr) // 2
     if max_yr - min_yr < 3:  # the default A/B windows need at least 4 calendar years
-        st.info("Pick a range of at least 4 years to compare two periods.")
+        st.info(f"Comparing two periods needs at least 4 calendar years of data; "
+                f"the selected indicators have data for {min_yr}–{max_yr} in this range.")
         return
     span = f"{min_yr}_{max_yr}"  # new range -> fresh defaults
 
@@ -1089,12 +1100,12 @@ if mode == "🇺🇸 US Economy":
         if col_data.empty:
             continue
         latest = col_data.iloc[-1]
-        prev   = col_data.iloc[-13] if len(col_data) > 13 else col_data.iloc[0]
+        prev   = year_ago(col_data)
         cfg    = US_INDICATORS[name]
         metric_cols[i].metric(
             label=name.split("(")[0].strip(),
             value=f"{latest:.1f}{cfg['unit']}",
-            delta=f"{latest - prev:+.1f}{cfg['unit']} vs yr ago",
+            delta=f"{latest - prev:+.1f}{cfg['unit']} vs yr ago" if prev is not None else None,
         )
 
     st.divider()
